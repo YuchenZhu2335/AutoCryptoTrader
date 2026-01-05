@@ -1,0 +1,46 @@
+name: Daily Trading Simulation
+
+on:
+  schedule:
+    - cron: '5 0 * * *' # Daily at UTC 0:05 (Beijing time 8:05)
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  run-simulation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to commit trading records back to repository
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Use full history to detect file changes correctly
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run trading simulation
+        run: |
+          python simulation_trader.py
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          if [ -n "$(git status --porcelain data/)" ]; then
+            echo "Detected changes in data/ directory, preparing to commit..."
+            git add data/
+            git commit -m "Auto update: $(date +'%Y-%m-%d %H:%M:%S') - Trading records and equity update" || exit 0
+            git push
+          else
+            echo "No changes in data/ directory, skipping commit"
+          fi
+
