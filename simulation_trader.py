@@ -3,7 +3,7 @@
 这是一个单次运行的脚本（One-shot script），用于每天被 GitHub Actions 定时唤醒。
 
 策略逻辑：MA200过滤 + 唐奇安通道 + ATR止损
-数据获取：使用 ccxt.binance 获取 BTC/USDT 日线数据
+数据获取：优先使用 ccxt.binance，失败则切换到 yfinance
 
 状态管理：
 - 读取 data/portfolio_state.json（如果不存在则初始化 10万U 资金）
@@ -18,6 +18,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import json
+import yfinance as yf
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -69,6 +70,81 @@ def fetch_data_ccxt(symbol='BTC/USDT', days=730):
     except Exception as e:
         print(f"Failed to fetch data from Binance: {e}")
         return None
+
+
+def fetch_data_yfinance(symbol='BTC/USDT', days=730):
+    """使用 yfinance 获取 BTC 数据（作为备选方案）
+    
+    注意：yfinance 使用 BTC-USD 作为交易对符号
+    """
+    try:
+        # yfinance 使用 BTC-USD 作为交易对
+        ticker_symbol = 'BTC-USD'
+        
+        # 计算时间范围
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        # 获取日线数据
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(start=start_date, end=end_date, interval='1d')
+        
+        if df.empty:
+            print(f"No data returned from Yahoo Finance for {ticker_symbol}")
+            return None
+        
+        # 重命名列以匹配标准格式（yfinance 返回的列名可能是大写）
+        df.columns = [col.lower() for col in df.columns]
+        
+        # 确保包含所需的列
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_columns):
+            print(f"Missing required columns in Yahoo Finance data")
+            return None
+        
+        # 选择所需的列
+        df = df[required_columns]
+        
+        # 确保索引是 datetime 类型
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        
+        print(f"Successfully fetched {len(df)} days of {ticker_symbol} data from Yahoo Finance")
+        return df
+        
+    except Exception as e:
+        print(f"Failed to fetch data from Yahoo Finance: {e}")
+        return None
+
+
+def get_data(symbol='BTC/USDT', days=730):
+    """获取数据，优先使用 ccxt，失败则使用 yfinance
+    
+    参数:
+        symbol: 交易对符号（如 'BTC/USDT'）
+        days: 需要获取的天数
+    
+    返回:
+        DataFrame: 包含 OHLCV 数据的 DataFrame，失败则返回 None
+    """
+    # 优先尝试从币安获取数据
+    print(f"Attempting to fetch {symbol} data from Binance...")
+    df = fetch_data_ccxt(symbol=symbol, days=days)
+    
+    # 如果币安获取失败，切换到 Yahoo Finance
+    if df is None or len(df) == 0:
+        print("Binance data fetch failed, switching to Yahoo Finance...")
+        df = fetch_data_yfinance(symbol=symbol, days=days)
+    
+    # 验证数据
+    if df is None or len(df) == 0:
+        print("ERROR: Failed to fetch data from both Binance and Yahoo Finance")
+        return None
+    
+    if len(df) < MA200_PERIOD:
+        print(f"WARNING: Data length ({len(df)}) is less than required MA200 period ({MA200_PERIOD})")
+    
+    return df
 
 
 # ========== 策略计算函数 ==========
@@ -285,13 +361,13 @@ def main():
     # 1. 加载投资组合状态
     state = load_portfolio_state()
     
-    # 2. 获取最新数据
+    # 2. 获取最新数据（优先币安，失败则使用 Yahoo Finance）
     symbol = state.get('symbol', 'BTC/USDT')
     print(f"\nFetching {symbol} data...")
-    df = fetch_data_ccxt(symbol=symbol, days=730)
+    df = get_data(symbol=symbol, days=730)
     
     if df is None or len(df) < MA200_PERIOD:
-        print("Insufficient data, cannot execute strategy")
+        print("ERROR: Insufficient data, cannot execute strategy")
         return
     
     # 3. 执行策略逻辑
@@ -331,4 +407,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
