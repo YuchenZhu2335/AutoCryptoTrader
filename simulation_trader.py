@@ -25,10 +25,16 @@ from pathlib import Path
 # ========== 配置参数 ==========
 INITIAL_CAPITAL = 100000  # 初始资金 10万 USDT
 FEE_RATE = 0.001  # 交易费率 0.1%（双边收取）
-DONCHIAN_PERIOD = 20  # 唐奇安通道周期
-ATR_MULTIPLIER = 2.0  # ATR 倍数
 ATR_PERIOD = 14  # ATR 计算周期
 MA200_PERIOD = 200  # MA200 周期
+
+# V5 集成策略配置（4个子策略，每个权重25%）
+STRATEGY_CONFIGS = [
+    {'donchian_period': 20, 'atr_multiplier': 5.0, 'weight': 0.25},
+    {'donchian_period': 30, 'atr_multiplier': 4.5, 'weight': 0.25},
+    {'donchian_period': 40, 'atr_multiplier': 4.0, 'weight': 0.25},
+    {'donchian_period': 50, 'atr_multiplier': 3.5, 'weight': 0.25},
+]
 
 # 数据文件路径
 DATA_DIR = Path(__file__).parent / "data"
@@ -148,7 +154,7 @@ def get_data(symbol='BTC/USDT', days=730):
 
 
 # ========== 策略计算函数 ==========
-def calculate_donchian_upper(df, period=DONCHIAN_PERIOD):
+def calculate_donchian_upper(df, period=20):
     """计算唐奇安通道上轨（过去N天的最高价）"""
     return df['high'].rolling(window=period).max().shift(1)
 
@@ -182,7 +188,7 @@ def load_portfolio_state():
         except Exception as e:
             print(f"Failed to load state file: {e}, using default values")
     
-    # 初始化状态
+    # 初始化状态（支持多子策略）
     state = {
         'symbol': 'BTC/USDT',
         'in_position': False,
@@ -192,7 +198,8 @@ def load_portfolio_state():
         'cash': INITIAL_CAPITAL,
         'position_size': 0.0,  # 持仓数量（BTC）
         'total_equity': INITIAL_CAPITAL,  # 总权益
-        'last_update': None
+        'last_update': None,
+        'sub_strategies': {}  # 存储每个子策略的状态
     }
     print(f"Initialized portfolio state: {state}")
     return state
@@ -254,23 +261,20 @@ def log_daily_balance(state, current_price):
 
 
 # ========== 策略执行函数 ==========
-def run_strategy_logic(df, state):
+def run_single_strategy_signal(df, donchian_period, atr_multiplier, state):
     """
-    执行策略逻辑（基于 V5 策略）
+    运行单个子策略，返回信号和状态
     
     返回:
-        action: 'BUY', 'SELL', 或 None
-        reason: 交易原因
-        new_state: 更新后的状态
+        signal: 1 (买入), -1 (卖出), 0 (无信号)
+        sub_state: 子策略的状态信息
     """
-    # 获取最新数据（最后一行）
     latest = df.iloc[-1]
     current_close = latest['close']
-    current_high = latest['high']
     current_low = latest['low']
     
-    # 计算指标（使用足够的历史数据）
-    df['donchian_upper'] = calculate_donchian_upper(df, period=DONCHIAN_PERIOD)
+    # 计算该子策略的指标
+    df['donchian_upper'] = calculate_donchian_upper(df, period=donchian_period)
     df['atr'] = calculate_atr(df, period=ATR_PERIOD)
     df['ma200'] = calculate_ma200(df)
     
@@ -278,25 +282,133 @@ def run_strategy_logic(df, state):
     latest_atr = df['atr'].iloc[-1]
     latest_ma200 = df['ma200'].iloc[-1]
     
-    action = None
-    reason = None
-    new_state = state.copy()
+    # 获取或初始化子策略状态
+    sub_key = f"{donchian_period}_{atr_multiplier}"
+    if sub_key not in state.get('sub_strategies', {}):
+        sub_state = {
+            'in_position': False,
+            'buy_price': None,
+            'trailing_stop': None,
+            'atr_at_buy': None
+        }
+    else:
+        sub_state = state['sub_strategies'][sub_key].copy()
     
-    if not state['in_position']:
+    signal = 0
+    
+    if not sub_state['in_position']:
         # 空仓状态：检查买入信号
-        # 条件：收盘价突破唐奇安上轨 且 收盘价 > MA200（趋势过滤）
         if (not np.isnan(latest_donchian) and 
             not np.isnan(latest_ma200) and
             current_close > latest_donchian and 
             current_close > latest_ma200):
             
+            signal = 1
+            sub_state['in_position'] = True
+            sub_state['buy_price'] = float(current_close)
+            sub_state['atr_at_buy'] = float(latest_atr if not np.isnan(latest_atr) else df['atr'].iloc[-2])
+            sub_state['trailing_stop'] = float(sub_state['buy_price'] - atr_multiplier * sub_state['atr_at_buy'])
+    else:
+        # 持仓状态：更新止损线并检查卖出信号
+        # 计算新的止损线（跟随价格上涨）
+        new_stop = current_close - atr_multiplier * sub_state['atr_at_buy']
+        if new_stop > sub_state['trailing_stop']:
+            sub_state['trailing_stop'] = float(new_stop)
+        
+        # 检查卖出信号：价格触及止损线
+        if current_low <= sub_state['trailing_stop']:
+            signal = -1
+            sub_state['in_position'] = False
+            sub_state['buy_price'] = None
+            sub_state['trailing_stop'] = None
+            sub_state['atr_at_buy'] = None
+    
+    return signal, sub_state
+
+
+def run_strategy_logic(df, state):
+    """
+    执行 V5 集成策略逻辑（多子策略组合）
+    
+    返回:
+        action: 'BUY', 'SELL', 或 None
+        reason: 交易原因
+        new_state: 更新后的状态
+    """
+    # 获取最新数据
+    latest = df.iloc[-1]
+    current_close = latest['close']
+    current_low = latest['low']
+    
+    # 计算 MA200（所有子策略共用）
+    df['ma200'] = calculate_ma200(df)
+    latest_ma200 = df['ma200'].iloc[-1]
+    
+    # 为每个子策略计算信号
+    sub_signals = {}
+    new_sub_states = {}
+    ensemble_position = 0.0  # 集成持仓比例（0-1）
+    
+    for config in STRATEGY_CONFIGS:
+        donchian_period = config['donchian_period']
+        atr_multiplier = config['atr_multiplier']
+        weight = config['weight']
+        
+        signal, sub_state = run_single_strategy_signal(
+            df.copy(), donchian_period, atr_multiplier, state
+        )
+        
+        sub_key = f"{donchian_period}_{atr_multiplier}"
+        sub_signals[sub_key] = signal
+        new_sub_states[sub_key] = sub_state
+        
+        # 计算集成持仓比例（加权平均）
+        if sub_state['in_position']:
+            ensemble_position += weight
+    
+    # 根据集成信号决定交易动作
+    action = None
+    reason = None
+    new_state = state.copy()
+    new_state['sub_strategies'] = new_sub_states
+    
+    # 判断买入：如果集成持仓比例从 < 0.5 变为 >= 0.5（多数子策略看多）
+    # 判断卖出：如果集成持仓比例从 >= 0.5 变为 < 0.5（多数子策略看空）
+    previous_position = 0.0
+    if 'sub_strategies' in state:
+        for config in STRATEGY_CONFIGS:
+            sub_key = f"{config['donchian_period']}_{config['atr_multiplier']}"
+            if sub_key in state['sub_strategies']:
+                if state['sub_strategies'][sub_key].get('in_position', False):
+                    previous_position += config['weight']
+    
+    if not state['in_position']:
+        # 空仓状态：检查买入信号（集成持仓比例 >= 0.5，且之前 < 0.5）
+        if ensemble_position >= 0.5 and previous_position < 0.5:
             # 执行买入
             buy_price = current_close
-            atr_at_buy = latest_atr if not np.isnan(latest_atr) else df['atr'].iloc[-2]
-            initial_stop = buy_price - ATR_MULTIPLIER * atr_at_buy
+            
+            # 使用加权平均的 ATR 和止损
+            weighted_atr = 0.0
+            weighted_stop = 0.0
+            for config in STRATEGY_CONFIGS:
+                sub_key = f"{config['donchian_period']}_{config['atr_multiplier']}"
+                if new_sub_states[sub_key]['in_position']:
+                    weighted_atr += config['weight'] * new_sub_states[sub_key]['atr_at_buy']
+                    weighted_stop += config['weight'] * new_sub_states[sub_key]['trailing_stop']
+            
+            # 如果所有子策略都看多，使用加权平均；否则使用最保守的止损
+            if weighted_stop > 0:
+                initial_stop = weighted_stop
+                atr_at_buy = weighted_atr
+            else:
+                # 使用最保守的止损（最高的止损线）
+                stops = [s['trailing_stop'] for s in new_sub_states.values() if s.get('trailing_stop')]
+                initial_stop = max(stops) if stops else buy_price * 0.9  # 默认10%止损
+                atr_at_buy = df['atr'].iloc[-1] if not np.isnan(df['atr'].iloc[-1]) else df['atr'].iloc[-2]
             
             # 计算可买入数量（扣除手续费）
-            available_cash = state['cash'] * (1 - FEE_RATE)  # 买入时扣除手续费
+            available_cash = state['cash'] * (1 - FEE_RATE)
             position_size = available_cash / buy_price
             
             # 更新状态
@@ -308,7 +420,10 @@ def run_strategy_logic(df, state):
             new_state['cash'] = 0.0
             
             action = 'BUY'
-            reason = f"Breakout above Donchian upper ({latest_donchian:.2f}) and price > MA200 ({latest_ma200:.2f})"
+            active_strategies = [f"{c['donchian_period']}/{c['atr_multiplier']}" 
+                                for c in STRATEGY_CONFIGS 
+                                if new_sub_states[f"{c['donchian_period']}_{c['atr_multiplier']}"]['in_position']]
+            reason = f"Ensemble signal: {len(active_strategies)}/4 strategies bullish, price > MA200 ({latest_ma200:.2f})"
     
     else:
         # 持仓状态：更新止损线并检查卖出信号
@@ -316,16 +431,24 @@ def run_strategy_logic(df, state):
         atr_at_buy = state['atr_at_buy']
         current_stop = state['trailing_stop']
         
-        # 计算新的止损线（跟随价格上涨）
-        new_stop = current_close - ATR_MULTIPLIER * atr_at_buy
-        if new_stop > current_stop:
-            current_stop = new_stop
-            new_state['trailing_stop'] = float(current_stop)
+        # 计算新的止损线（使用所有持仓子策略中最保守的止损）
+        active_stops = []
+        for config in STRATEGY_CONFIGS:
+            sub_key = f"{config['donchian_period']}_{config['atr_multiplier']}"
+            if new_sub_states[sub_key]['in_position'] and new_sub_states[sub_key].get('trailing_stop'):
+                active_stops.append(new_sub_states[sub_key]['trailing_stop'])
         
-        # 检查卖出信号：价格触及止损线
-        if current_low <= current_stop:
+        if active_stops:
+            # 使用最保守的止损（最高的止损线，即最不容易触发）
+            new_stop = max(active_stops)
+            if new_stop > current_stop:
+                current_stop = new_stop
+                new_state['trailing_stop'] = float(current_stop)
+        
+        # 检查卖出信号：集成持仓比例 < 0.5 或价格触及止损线
+        if ensemble_position < 0.5 or current_low <= current_stop:
             # 执行卖出
-            sell_price = current_stop  # 以止损价成交
+            sell_price = current_stop if current_low <= current_stop else current_close
             
             # 计算卖出后现金（扣除手续费）
             position_size = state['position_size']
@@ -340,7 +463,10 @@ def run_strategy_logic(df, state):
             new_state['position_size'] = 0.0
             
             action = 'SELL'
-            reason = f"Hit trailing stop ({current_stop:.2f})"
+            if current_low <= current_stop:
+                reason = f"Hit trailing stop ({current_stop:.2f})"
+            else:
+                reason = f"Ensemble signal: {sum(1 for s in new_sub_states.values() if s['in_position'])}/4 strategies bearish"
     
     # 计算总权益
     if new_state['in_position']:
@@ -370,8 +496,11 @@ def main():
         print("ERROR: Insufficient data, cannot execute strategy")
         return
     
-    # 3. 执行策略逻辑
-    print(f"\nExecuting strategy logic...")
+    # 3. 执行策略逻辑（V5 集成策略）
+    print(f"\nExecuting V5 Ensemble Strategy...")
+    print(f"Strategy pool: {len(STRATEGY_CONFIGS)} sub-strategies")
+    for idx, config in enumerate(STRATEGY_CONFIGS):
+        print(f"  Sub-strategy {idx+1}: Period={config['donchian_period']}, ATR={config['atr_multiplier']}, Weight={config['weight']*100:.0f}%")
     action, reason, new_state = run_strategy_logic(df, state)
     
     # 4. 如果有交易，记录交易
