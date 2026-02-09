@@ -7,7 +7,7 @@
   "cash": 100000,
   "position_size": 0.0,
   "total_equity": 100000,
-  "last_update": "2026-02-08T03:29:45.128863",
+  "last_update": "2026-02-09T03:14:47.250613",
   "sub_strategies": {
     "20_5.0": {
       "in_position": false,
